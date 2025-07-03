@@ -1,0 +1,435 @@
+{{- $authorities := .Values.agentList.authorities | default (list) }}
+{{- $providers := .Values.agentList.providers | default (list) }}
+{{- $consumers := .Values.agentList.consumers | default (list) }}
+{{- $namespace := .Values.cluster.namespace | default "" }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.cluster.namespace }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "{{ .Values.cluster.namespace }}-vswh"
+{{- range .Values.agentList.authorities }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ . }}
+{{- end }}
+
+{{- range .Values.agentList.consumers }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ . }}
+{{- end }}
+
+{{- range .Values.agentList.providers }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ . }}
+{{- end }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Values.argocd.appname }}
+  namespace: {{ .Values.argocd.namespace }}
+spec:
+  syncPolicy:
+    automated: {}
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+      - CreateNamespace=true
+      - ServerSideApply=true
+  ignoreDifferences:
+    - kind: Secret
+      name: logstash-writer-secret
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: user-monitoring-secret
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: pg-admin-secret
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: redpanda-secret
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: redis-secrets
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: mailpit-secrets
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: kafka-users-secret
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: keycloak-secrets
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: gitea-secrets
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: ejbca-secret
+      jsonPointers:
+        - /data
+  project: {{ .Values.project }}
+  destination:
+    server: {{ .Values.cluster.address }}
+    namespace: {{ .Values.cluster.namespace }}
+  sources:
+  - repoURL: {{ .Values.values.repo_URL }}
+    targetRevision: {{ .Values.values.branch }}
+    ref: values
+  {{- if .Values.monitoring.enabled }}
+  - repoURL: {{ .Values.monitoring.operator.repo_URL }}
+    targetRevision: {{ .Values.monitoring.operator.targetRevision }}
+    chart: {{ .Values.monitoring.operator.crds_chart_name }}
+  - repoURL: {{ .Values.monitoring.operator.repo_URL }}
+    targetRevision: {{ .Values.monitoring.operator.targetRevision }}
+    chart: {{ .Values.monitoring.operator.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.monitoring.operator.valueFiles }}
+        - $values/app-values/monitoring-operator/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.monitoring.operator.nameOverride }}-{{ .Release.Namespace }}
+        managedNamespaces: [{{ join "," (concat .Values.agentList.authorities .Values.agentList.providers .Values.agentList.consumers (list .Values.cluster.namespace)) }}]
+  - repoURL: "https://code.europa.eu/api/v4/projects/{{ .Values.monitoring.projectID }}/packages/helm/stable"
+    path: ''
+    targetRevision: {{ .Values.monitoring.targetRevision }}
+    chart: {{ .Values.monitoring.chart_name }}
+    helm:
+      releaseName: {{ .Values.monitoring.fullnameOverride }}
+      valueFiles:
+        {{- range .Values.monitoring.valueFiles }}
+        - $values/app-values/monitoring/{{ . }}
+        {{- end }}
+      values: |
+        clusterIssuer: {{ .Values.cluster.issuer }}
+        domainSuffix: {{ .Values.domainSuffix }}
+        namespaceTag: {{ .Values.namespaceTag }}
+        mainNamespace: {{ .Values.namespaceTag }}
+        metricbeat:
+          kubeStateHost: {{ .Values.cluster.kubeStateHost }}
+        elasticsearch:
+          diskSpace: {{ .Values.monitoring.params.diskSpace.elasticsearch }}
+          count: {{ .Values.monitoring.params.count.elasticsearch }}
+        logstash:
+          diskSpace: {{ .Values.monitoring.params.diskSpace.logstash }}
+          count_beats: {{ .Values.monitoring.params.count.logstash }}
+        kibana:
+          count: {{ .Values.monitoring.params.count.kibana }}
+        heartbeat:
+          services:
+            heartbeat.monitors:
+            - type: tcp
+              name: Elasticsearch Service
+              id: elasticsearch:9200
+              schedule: '@every 5s'
+              hosts: ["elastic-elasticsearch-es-http.{{ .Values.cluster.namespace }}.svc:9200"]
+            - type: tcp
+              name: Kibana GUI
+              id: kibana:443
+              schedule: '@every 5s'
+              hosts: ["kibana.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}:443"]
+            - type: icmp
+              id: kibana/icmp
+              name: Kibana ICMP
+              hosts: ["elastic-kibana-kb-http.{{ .Values.cluster.namespace }}.svc"]
+              schedule: '*/5 * * * * * *'
+  {{- end }}
+  - repoURL: {{ .Values.vault_operator.repo_URL }}
+    targetRevision: {{ .Values.vault_operator.targetRevision }}
+    chart: {{ .Values.vault_operator.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.vault_operator.valueFiles }}
+        - $values/app-values/vault-operator/{{ . }}
+        {{- end }}
+      values: |
+        watchNamespace: {{ .Values.cluster.namespace }}
+        fullnameOverride: vault-operator-{{ .Release.Namespace }}
+        {{- if .Values.vault_operator.resources }}
+        resources: {{- toYaml .Values.vault_operator.resources | nindent 10 }}
+        {{- end }}
+  - repoURL: {{ .Values.vault_injector.repo_URL }}
+    targetRevision: {{ .Values.vault_injector.targetRevision }}
+    chart: {{ .Values.vault_injector.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.vault_injector.valueFiles }}
+        - $values/app-values/vault-injector/{{ . }}
+        {{- end }}
+      values: |
+        injector:
+          enabled: true
+          externalVaultAddr: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+        server:
+          enabled: false
+  - repoURL: "https://code.europa.eu/api/v4/projects/{{ .Values.vault.projectID }}/packages/helm/stable"
+    targetRevision: {{ .Values.vault.targetRevision }}
+    chart: {{ .Values.vault.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.vault.valueFiles }}
+        - $values/app-values/vault/{{ . }}
+        {{- end }}
+      values: |
+        domainSuffix: {{ .Values.domainSuffix }}
+        namespaceTag: {{ .Values.namespaceTag }}
+        cluster:
+          issuer: {{ .Values.cluster.issuer }}
+          namespace: {{ .Values.cluster.namespace }}
+        hashicorp:
+          service: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          secretEngine: {{ .Values.hashicorp.secretEngine }}
+          role: {{ .Values.hashicorp.role }}
+        agentList:
+          {{- toYaml .Values.agentList | nindent 10 }}
+        fullnameOverride: vault-{{ .Release.Namespace }}
+        {{- if .Values.vault.resources }}
+        resources: {{- toYaml .Values.vault.resources | nindent 10 }}
+        {{- end }}
+  - repoURL: {{ .Values.confluent_operator.repo_URL }}
+    targetRevision: {{ .Values.confluent_operator.targetRevision }}
+    chart: {{ .Values.confluent_operator.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.confluent_operator.valueFiles }}
+        - $values/app-values/confluent-operator/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.confluent_operator.nameOverride }}
+        name: confluent-operator-{{ .Release.Namespace }}
+        kRaftEnabled: true
+  - repoURL: "https://code.europa.eu/api/v4/projects/{{ .Values.kafka.projectID }}/packages/helm/stable"
+    path: ''
+    targetRevision: {{ .Values.kafka.targetRevision }}
+    chart: {{ .Values.kafka.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.kafka.valueFiles }}
+        - $values/app-values/kafka/{{ . }}
+        {{- end }}
+      values: |
+        clusterIssuer: {{ .Values.cluster.issuer }}
+        kafka:
+          auth:
+            enabled: {{ .Values.kafka.auth.enabled }}
+          topic:
+            autocreate: {{ .Values.kafka.topic.autocreate }}
+        hashicorp:
+          service: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          role: {{ .Values.hashicorp.role }}
+          secretEngine: {{ .Values.hashicorp.secretEngine }}
+  - repoURL: {{ .Values.redpanda.repo_URL }}
+    targetRevision: {{ .Values.redpanda.targetRevision }}
+    chart: {{ .Values.redpanda.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.redpanda.valueFiles }}
+        - $values/app-values/redpanda/{{ . }}
+        {{- end }}
+      values: |
+        automountServiceAccountToken: true
+        extraEnv:
+          {{- if .Values.kafka.auth.enabled }}
+          - name: KAFKA_SASL_PASSWORD
+            value: vault:{{ .Values.hashicorp.secretEngine }}/data/{{ .Values.cluster.namespace }}-kafka-credentials#redpanda
+          {{- end }}
+        podAnnotations:
+          vault.security.banzaicloud.io/vault-addr: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          vault.security.banzaicloud.io/vault-role: {{ .Values.hashicorp.role }}
+        fullnameOverride: {{ .Values.redpanda.nameOverride }}
+        console:
+          config:
+            kafka:
+              brokers:
+                - kafka.{{ .Values.cluster.namespace }}.svc.cluster.local:9092
+              {{- if .Values.kafka.auth.enabled }}
+              sasl:
+                enabled: true
+                username: redpanda
+                mechanism: PLAIN
+              {{- end }}
+        ingress:
+          hosts:
+            - host: redpanda.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend: 
+                    service:
+                      name: redpanda
+                      port:
+                        number: 8080
+          tls:
+            - secretName: redpanda-tls
+              hosts:
+                - redpanda.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          annotations:
+            cert-manager.io/cluster-issuer: {{ .Values.cluster.issuer }}
+            vault.security.banzaicloud.io/vault-addr: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+            vault.security.banzaicloud.io/vault-role: {{ .Values.hashicorp.role }}
+  - repoURL: {{ .Values.pg_operator.repo_URL }}
+    targetRevision: {{ .Values.pg_operator.targetRevision }}
+    chart: {{ .Values.pg_operator.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.pg_operator.valueFiles }}
+        - $values/app-values/pg-operator/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.pg_operator.nameOverride }}-{{ .Release.Namespace }}
+        configKubernetes:
+          watched_namespace: {{ .Values.cluster.namespace }}
+  - repoURL: {{ .Values.pg_admin.repo_URL }}
+    targetRevision: {{ .Values.pg_admin.targetRevision }}
+    chart: {{ .Values.pg_admin.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.pg_admin.valueFiles }}
+        - $values/app-values/pg-admin/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.pg_admin.nameOverride }}-{{ .Release.Namespace }}
+        env:
+          email: admin@{{ .Values.domainSuffix }}
+        podAnnotations:
+          vault.security.banzaicloud.io/vault-addr: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          vault.security.banzaicloud.io/vault-role: {{ .Values.hashicorp.role }}
+        ingress:
+          hosts:
+            - host: pgadmin.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend: 
+                    service:
+                      name: {{ .Values.pg_admin.nameOverride }}-{{ .Release.Namespace }}
+                      port:
+                        number: 80
+          tls:
+            - secretName: pgadmin-tls-{{ .Release.Namespace }}
+              hosts:
+                - pgadmin.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          annotations:
+            cert-manager.io/cluster-issuer: {{ .Values.cluster.issuer }}
+  - repoURL: "https://code.europa.eu/api/v4/projects/{{ .Values.pg_cluster.projectID }}/packages/helm/stable"
+    path: ''
+    targetRevision: {{ .Values.pg_cluster.targetRevision }}
+    chart: {{ .Values.pg_cluster.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.pg_cluster.valueFiles }}
+        - $values/app-values/pg-cluster/{{ . }}
+        {{- end }}
+      values: |
+        authorityList: {{ .Values.agentList.authorities }}
+        consumerList: {{ .Values.agentList.consumers }}
+        providerList: {{ .Values.agentList.providers }}
+  - repoURL: {{ .Values.redis.repo_URL }}
+    targetRevision: {{ .Values.redis.targetRevision }}
+    fullnameOverride: {{.Values.redis_commander.fullnameOverride}}
+    chart: {{ .Values.redis.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.redis.valueFiles }}
+        - $values/app-values/Redis/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.redis.nameOverride }}
+  - repoURL: {{ .Values.redis_commander.repo_URL }}
+    targetRevision: {{ .Values.redis_commander.targetRevision }}
+    path: {{.Values.redis_commander.path}}
+    chart: {{ .Values.redis_commander.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.redis_commander.valueFiles }}
+        - $values/app-values/Redis_commander/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.redis_commander.nameOverride }}
+        ingress:
+          hosts:
+          - host: redis-commander.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+            paths:
+              - "/"
+          tls:
+          - secretName: redis-commander-tls
+            hosts:
+              - redis-commander.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          annotations:
+            cert-manager.io/cluster-issuer: {{ .Values.cluster.issuer }}
+        redis:
+          host: "redis-master.{{ .Values.cluster.namespace }}.svc.cluster.local"
+        podAnnotations:
+          vault.security.banzaicloud.io/vault-addr: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          vault.security.banzaicloud.io/vault-role: {{ .Values.hashicorp.role }}
+        {{- if .Values.redis_commander.master }}
+        master: {{- toYaml .Values.redis_commander.master | nindent 10 }}
+        {{- end }}
+  - repoURL: "https://code.europa.eu/api/v4/projects/{{ .Values.notification.projectID }}/packages/helm/stable"
+    targetRevision: {{ .Values.notification.targetRevision }}
+    chart: {{ .Values.notification.chart_name }}
+    helm:
+      releaseName: {{ .Values.notification.nameOverride }}
+      valueFiles:
+        {{- range .Values.notification.valueFiles }}
+        - $values/app-values/notification/{{ . }}
+        {{- end }}
+      values: |
+        deployment:
+          vault:
+            hashicorp:
+              service: https://vault.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+              secretEngine: {{ .Values.hashicorp.secretEngine }}
+              role: {{ .Values.hashicorp.role }}
+              secretConfigPath: "{{ .Values.hashicorp.secretEngine }}/{{ .Values.cluster.namespace }}-notifications"
+          kafka:
+            bootstrapServer: http://kafka.{{ .Values.cluster.namespace }}.svc.cluster.local:9092
+        {{- if .Values.mailpit.enabled }}
+          mail:
+            smtpHost: mailpit-{{ .Values.cluster.namespace }}-smtp
+            smtpUser: smtp
+        {{- end }}
+        {{- if .Values.notification.resources }}
+        resources: {{- toYaml .Values.notification.resources | nindent 10 }}
+        {{- end }}
+  {{- if .Values.mailpit.enabled }}
+  - repoURL: {{ .Values.mailpit.repo_URL }}
+    targetRevision: {{ .Values.mailpit.targetRevision }}
+    chart: {{ .Values.mailpit.chart_name }}
+    helm:
+      valueFiles:
+        {{- range .Values.mailpit.valueFiles }}
+        - $values/app-values/mailpit/{{ . }}
+        {{- end }}
+      values: |
+        fullnameOverride: {{ .Values.mailpit.nameOverride }}-{{ .Release.Namespace }}
+        ingress:
+          enabled: true
+          annotations:
+            cert-manager.io/cluster-issuer: {{ .Values.cluster.issuer }}
+          hostname: mailpit.{{ .Values.namespaceTag }}.{{ .Values.domainSuffix }}
+          ingressClassName: nginx
+          tls: true
+  {{- end }}
